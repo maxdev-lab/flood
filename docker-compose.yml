@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3  # PostGIS가 포함된 공식 이미지
+    container_name: flood_postgis_db
+    restart: always
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=1234
+      - POSTGRES_DB=flood_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data  # 데이터 유지를 위한 볼륨 설정
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d flood_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  default:
+    name: flood_network
