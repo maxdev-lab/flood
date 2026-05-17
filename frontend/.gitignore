@@ -1,0 +1,17 @@
+*.iml
+.gradle
+/local.properties
+/.idea
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+
+# 내 위치 키 보안
+local.properties
+
+# 앱 빌드 파일들
+/app/build/
+/app/src/test/
+/app/src/androidTest/

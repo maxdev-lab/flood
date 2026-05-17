@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 방향을 가리키는 내 위치 마커 (위쪽이 진행 방향) -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="36dp"
+    android:height="36dp"
+    android:viewportWidth="36"
+    android:viewportHeight="36">
+
+    <!-- 그림자 원 -->
+    <path
+        android:fillColor="#33000000"
+        android:pathData="M18,20 m-10,0 a10,10 0 1,0 20,0 a10,10 0 1,0 -20,0" />
+
+    <!-- 파란 원 (내 위치) -->
+    <path
+        android:fillColor="#1976D2"
+        android:pathData="M18,19 m-9,0 a9,9 0 1,0 18,0 a9,9 0 1,0 -18,0" />
+
+    <!-- 흰 중심 점 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M18,19 m-3.5,0 a3.5,3.5 0 1,0 7,0 a3.5,3.5 0 1,0 -7,0" />
+
+    <!-- 방향 화살표 (위쪽) -->
+    <path
+        android:fillColor="#1976D2"
+        android:pathData="M18,4 L13,12 L18,10 L23,12 Z" />
+
+</vector>
