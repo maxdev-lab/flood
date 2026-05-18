@@ -15,6 +15,26 @@ from typing import List, Optional
 
 from app.mape.analyze import RiskResult
 
+# 시뮬레이션 상태
+_simulate_mode = False
+_simulate_rainfall = 0.0
+_simulate_sewer = 0.0
+
+def set_simulate(rainfall: float, sewer: float):
+    global _simulate_mode, _simulate_rainfall, _simulate_sewer
+    _simulate_mode = True
+    _simulate_rainfall = rainfall
+    _simulate_sewer = sewer
+
+def clear_simulate():
+    global _simulate_mode, _simulate_rainfall, _simulate_sewer
+    _simulate_mode = False
+    _simulate_rainfall = 0.0
+    _simulate_sewer = 0.0
+
+def get_simulate():
+    return _simulate_mode, _simulate_rainfall, _simulate_sewer
+
 # ── 전역 인메모리 캐시 ────────────────────────────────────────
 # API 응답 시 DB 조회 없이 즉시 반환하기 위한 최신 분석 결과 저장소
 _latest_results: List[RiskResult] = []

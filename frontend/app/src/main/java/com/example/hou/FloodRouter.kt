@@ -21,30 +21,17 @@ class FloodRouter(
     private val floodDataset: FloodDataset
 ) {
 
-    companion object {
-        /** 우회 대상 최소 위험도 (0~100) */
-        const val RISK_THRESHOLD = 70
-
-        /** 블록 측면에서 앵커까지 추가 여유 거리 (미터) */
-        const val ANCHOR_MARGIN_M = 200.0
-
-        /** 이 거리 이내의 위험 셀을 하나의 클러스터로 묶음 (미터) */
-        const val CLUSTER_MERGE_RADIUS_M = 150.0
-
-        /** 경로 위험 판정 반경 (미터) — isRouteInDanger 전용 */
-        const val ROUTE_DANGER_RADIUS_M = 80.0
-
-        /** 클러스터 AABB 확장 여유치 — 경로 교차 감지용 (미터) */
-        const val ROUTE_CHECK_MARGIN_M = 60.0
-
-        /** 목적지 위험 판정 반경 (미터) */
-        const val DEST_DANGER_RADIUS_M = 100.0
-
-        /** 블록이 경로 전체 길이의 이 비율 이상을 막으면 우회 불가로 판단 */
-        const val BYPASS_IMPOSSIBLE_RATIO = 0.85
+     companion object {
+        const val RISK_THRESHOLD = 55
+        const val ANCHOR_MARGIN_M = 80.0
+        const val CLUSTER_MERGE_RADIUS_M = 200.0
+        const val ROUTE_CHECK_MARGIN_M = 120.0
+        const val BYPASS_IMPOSSIBLE_RATIO = 0.99
+        const val ROUTE_DANGER_RADIUS_M = 80.0    // ← 추가
+        const val DEST_DANGER_RADIUS_M = 100.0    // ← 추가
     }
 
-    private val dangerCells: List<FloodCell> by lazy {
+    internal val dangerCells: List<FloodCell> by lazy {
         floodDataset.cells.filter { it.riskLevel >= RISK_THRESHOLD }
     }
 
@@ -74,9 +61,28 @@ class FloodRouter(
         val blocking = dangerClusters.filter { isClusterBlockingPath(it, start, end) }
         if (blocking.isEmpty()) return false
 
+        // 모든 클러스터가 완전히 경로를 막고 있을 때만 불가 판정
         val bearing = bearingRad(start.latitude, start.longitude, end.latitude, end.longitude)
         val blockingWidth = blocking.sumOf { clusterProjectionWidthM(it, bearing) }
-        return (blockingWidth / totalDistM) >= BYPASS_IMPOSSIBLE_RATIO
+
+        // 추가 조건: 우회 앵커 후보가 전부 위험구역 안에 있을 때만 불가
+        val aabb = mergeBoundingBoxes(blocking)
+        val cosLat = cos(Math.toRadians((aabb.minLat + aabb.maxLat) / 2.0))
+        val perpWidth = clusterPerpWidthM(aabb, bearing, cosLat)
+        val midLat = (aabb.minLat + aabb.maxLat) / 2.0
+        val midLon = (aabb.minLon + aabb.maxLon) / 2.0
+        val leftAnchor = lateralOffset(midLat, midLon, bearing, -(perpWidth / 2.0 + ANCHOR_MARGIN_M), cosLat)
+        val rightAnchor = lateralOffset(midLat, midLon, bearing, +(perpWidth / 2.0 + ANCHOR_MARGIN_M), cosLat)
+
+        val leftInDanger = dangerCells.any {
+            haversineM(leftAnchor.latitude, leftAnchor.longitude, it.centerLat, it.centerLon) < ANCHOR_MARGIN_M * 0.5
+        }
+        val rightInDanger = dangerCells.any {
+            haversineM(rightAnchor.latitude, rightAnchor.longitude, it.centerLat, it.centerLon) < ANCHOR_MARGIN_M * 0.5
+        }
+
+        // 양쪽 앵커 모두 위험 AND 비율도 높을 때만 불가
+        return (blockingWidth / totalDistM) >= BYPASS_IMPOSSIBLE_RATIO && leftInDanger && rightInDanger
     }
 
     /**
@@ -86,34 +92,40 @@ class FloodRouter(
      */
     fun findBypassAnchors(start: TMapPoint, end: TMapPoint): List<TMapPoint> {
         if (dangerClusters.isEmpty()) return emptyList()
-
         val blocking = dangerClusters.filter { isClusterBlockingPath(it, start, end) }
         if (blocking.isEmpty()) return emptyList()
 
         val bearing = bearingRad(start.latitude, start.longitude, end.latitude, end.longitude)
-        val aabb    = mergeBoundingBoxes(blocking)
-        val midLat  = (aabb.minLat + aabb.maxLat) / 2.0
-        val midLon  = (aabb.minLon + aabb.maxLon) / 2.0
-        val cosLat  = cos(Math.toRadians(midLat))
+        val aabb = mergeBoundingBoxes(blocking)
+        val cosLat = cos(Math.toRadians((aabb.minLat + aabb.maxLat) / 2.0))
 
-        val (projLat, projLon) = projectOntoPath(midLat, midLon, start, end, bearing, cosLat)
+        // 위험구역 AABB 모서리 4개 중 출발~도착 직선에서
+        // 가장 가까운 안전 모서리를 앵커로 사용
+        val corners = listOf(
+            TMapPoint(aabb.minLat - 0.001, aabb.minLon - 0.001),
+            TMapPoint(aabb.minLat - 0.001, aabb.maxLon + 0.001),
+            TMapPoint(aabb.maxLat + 0.001, aabb.minLon - 0.001),
+            TMapPoint(aabb.maxLat + 0.001, aabb.maxLon + 0.001),
+        )
 
-        val perpWidth = clusterPerpWidthM(aabb, bearing, cosLat)
-        val offset    = perpWidth / 2.0 + ANCHOR_MARGIN_M
+        // 위험구역과 겹치지 않는 모서리만 필터
+        val safeCorners = corners.filter { corner ->
+            dangerCells.none { cell ->
+                haversineM(corner.latitude, corner.longitude,
+                    cell.centerLat, cell.centerLon) < ANCHOR_MARGIN_M * 0.8
+            }
+        }
 
-        val leftAnchor  = lateralOffset(projLat, projLon, bearing, -offset, cosLat)
-        val rightAnchor = lateralOffset(projLat, projLon, bearing, +offset, cosLat)
+        if (safeCorners.isEmpty()) return emptyList()
 
-        val safeLeft  = pushAnchorClear(leftAnchor,  bearing, -1.0, cosLat)
-        val safeRight = pushAnchorClear(rightAnchor, bearing, +1.0, cosLat)
+        // 전체 경로 거리가 가장 짧은 모서리 1개 선택
+        val best = safeCorners.minByOrNull { corner ->
+            haversineM(start.latitude, start.longitude, corner.latitude, corner.longitude) +
+                    haversineM(corner.latitude, corner.longitude, end.latitude, end.longitude)
+        } ?: return emptyList()
 
-        fun dist(a: TMapPoint) =
-            haversineM(start.latitude, start.longitude, a.latitude, a.longitude) +
-            haversineM(a.latitude, a.longitude, end.latitude, end.longitude)
-
-        return listOf(if (dist(safeLeft) <= dist(safeRight)) safeLeft else safeRight)
+        return listOf(best)
     }
-
     /** 하위 호환용 단일 앵커 반환 */
     fun findBypassAnchor(start: TMapPoint, end: TMapPoint): TMapPoint? =
         findBypassAnchors(start, end).firstOrNull()

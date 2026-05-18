@@ -153,12 +153,14 @@ class RouteManager(
                 try {
                     val resp = RetrofitClient.tmapService.getCarRoute(
                         appKey = BuildConfig.TMAP_APP_KEY,
-                        body   = buildRouteBody(start, end)
+                        body = buildRouteBody(start, end)
                     )
                     withContext(Dispatchers.Main) {
                         if (resp.isSuccessful && resp.body() != null) {
-                            applyRouteFeatures(resp.body()!!.features, isRerouting,
-                                bannerState = FloodBannerState.UNAVOIDABLE)
+                            applyRouteFeatures(
+                                resp.body()!!.features, isRerouting,
+                                bannerState = FloodBannerState.UNAVOIDABLE
+                            )
                         } else {
                             Toast.makeText(context, "경로 탐색에 실패했습니다.", Toast.LENGTH_SHORT).show()
                         }
@@ -192,7 +194,7 @@ class RouteManager(
                     async {
                         RetrofitClient.tmapService.getCarRoute(
                             appKey = BuildConfig.TMAP_APP_KEY,
-                            body   = buildRouteBody(from, to)
+                            body = buildRouteBody(from, to)
                         )
                     }
                 }
@@ -202,34 +204,38 @@ class RouteManager(
                     val bodies = responses.map { if (it.isSuccessful) it.body() else null }
 
                     if (bodies.any { it == null }) {
-                        Toast.makeText(context, "우회 경로 탐색에 실패했습니다. 일반 경로로 안내합니다.", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "우회 경로 탐색 실패 — 일반 경로로 안내합니다.", Toast.LENGTH_SHORT)
+                            .show()
                         findRoute(start, end, isRerouting)
                         return@withContext
                     }
 
                     stitchMultiAndApply(
                         featuresList = bodies.map { it!!.features },
-                        router       = router,
-                        isRerouting  = isRerouting
+                        router       = FloodRouter(floodDataset),
+                        isRerouting  = isRerouting,
+                        start        = start,
+                        end          = end
                     )
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "네트워크 연결이 불안정합니다.", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "네트워크 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
-
     // ──────────────────────────────────────────
     // 구간 이어붙이기 및 경로 적용
     // ──────────────────────────────────────────
     private fun stitchMultiAndApply(
         featuresList: List<List<RouteFeature>>,
         router: FloodRouter,
-        isRerouting: Boolean
+        isRerouting: Boolean,
+        start: TMapPoint,
+        end: TMapPoint,
+        retryCount: Int = 0  // 재시도 횟수
     ) {
-        // 각 구간 포인트/스텝 추출, 구간 경계 중복 포인트 제거
         var pointOffset = 0
         val stitchedPoints = mutableListOf<TMapPoint>()
         val stitchedSteps  = mutableListOf<RouteStep>()
@@ -237,11 +243,8 @@ class RouteManager(
         featuresList.forEachIndexed { idx, features ->
             val pts   = extractPoints(features)
             val steps = extractSteps(features, stepIndexOffset = pointOffset)
-            if (idx == 0) {
-                stitchedPoints.addAll(pts)
-            } else {
-                stitchedPoints.addAll(pts.drop(1))  // 앞 구간 마지막 == 이 구간 첫 포인트
-            }
+            if (idx == 0) stitchedPoints.addAll(pts)
+            else stitchedPoints.addAll(pts.drop(1))
             stitchedSteps.addAll(steps)
             pointOffset += pts.size
         }
@@ -249,26 +252,108 @@ class RouteManager(
         val totalTime = featuresList.sumOf { extractTotalTime(it) }
         val totalDist = featuresList.sumOf { extractTotalDistance(it) }
 
-        val finalBanner = if (router.isRouteInDanger(stitchedPoints)) {
-            FloodBannerState.UNAVOIDABLE
-        } else {
-            FloodBannerState.DETOUR_ACTIVE
+        // 경로가 위험구역 통과하고 재시도 가능하면 → 통과한 셀 제외 후 재탐색
+        val dangerousPoints = stitchedPoints.filter { pt ->
+            router.dangerCells.any { cell ->
+                router.haversineM(pt.latitude, pt.longitude, cell.centerLat, cell.centerLon) < FloodRouter.ROUTE_DANGER_RADIUS_M
+            }
         }
 
-        allRoutePoints.clear()
-        allRoutePoints.addAll(stitchedPoints)
-        routeSteps.clear()
-        routeSteps.addAll(stitchedSteps)
+        if (dangerousPoints.isNotEmpty() && retryCount < 3) {
+            // 경로가 통과한 위험 셀들을 블랙리스트에 추가해서 새 router 생성
+            val passedDangerCells = router.dangerCells.filter { cell ->
+                dangerousPoints.any { pt ->
+                    router.haversineM(pt.latitude, pt.longitude, cell.centerLat, cell.centerLon) < FloodRouter.ROUTE_DANGER_RADIUS_M
+                }
+            }
 
-        onFloodBanner?.invoke(finalBanner)
-        drawPolyline()
+            // 통과한 위험 셀 제외한 새 데이터셋으로 재탐색
+            val filteredDataset = FloodDataset(
+                floodDataset.cells.filter { cell ->
+                    passedDangerCells.none { bad ->
+                        bad.centerLat == cell.centerLat && bad.centerLon == cell.centerLon
+                    }
+                }
+            )
+            val newRouter = FloodRouter(filteredDataset)
+            val newAnchors = newRouter.findBypassAnchors(start, end)
+
+            if (newAnchors.isNotEmpty()) {
+                val waypoints = listOf(start) + newAnchors + listOf(end)
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        val deferreds = waypoints.zipWithNext().map { (from, to) ->
+                            async {
+                                RetrofitClient.tmapService.getCarRoute(
+                                    appKey = BuildConfig.TMAP_APP_KEY,
+                                    body   = buildRouteBody(from, to)
+                                )
+                            }
+                        }
+                        val responses = deferreds.map { it.await() }
+                        withContext(Dispatchers.Main) {
+                            val bodies = responses.map { if (it.isSuccessful) it.body() else null }
+                            if (bodies.any { it == null }) {
+                                // 재탐색도 실패 → 현재 경로 그대로 사용
+                                applyFinal(stitchedPoints, stitchedSteps, totalTime, totalDist,
+                                    FloodBannerState.UNAVOIDABLE, isRerouting)
+                                return@withContext
+                            }
+                            stitchMultiAndApply(
+                                featuresList = bodies.map { it!!.features },
+                                router       = newRouter,
+                                isRerouting  = isRerouting,
+                                start        = start,
+                                end          = end,
+                                retryCount   = retryCount + 1
+                            )
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            applyFinal(stitchedPoints, stitchedSteps, totalTime, totalDist,
+                                FloodBannerState.UNAVOIDABLE, isRerouting)
+                        }
+                    }
+                }
+                return  // 재탐색 중이므로 여기서 리턴
+            }
+        }
+
+        // 최종 적용
+        val finalBanner = if (dangerousPoints.isNotEmpty())
+            FloodBannerState.UNAVOIDABLE
+        else
+            FloodBannerState.DETOUR_ACTIVE
+
+        applyFinal(stitchedPoints, stitchedSteps, totalTime, totalDist, finalBanner, isRerouting)
+    }
+
+    private fun applyFinal(
+        points: List<TMapPoint>,
+        steps: List<RouteStep>,
+        totalTime: Int,
+        totalDist: Int,
+        bannerState: FloodBannerState,
+        isRerouting: Boolean
+    ) {
+        allRoutePoints.clear()
+        allRoutePoints.addAll(points)
+        routeSteps.clear()
+        routeSteps.addAll(steps)
+
+        onFloodBanner?.invoke(bannerState)
+        drawPolyline(isDetour = bannerState == FloodBannerState.DETOUR_ACTIVE)
 
         if (isRerouting) {
             upcomingSteps.clear()
             upcomingSteps.addAll(routeSteps)
             onRerouteComplete()
         } else {
-            val suffix = if (finalBanner == FloodBannerState.DETOUR_ACTIVE) " 🔀 우회 경로" else ""
+            val suffix = when (bannerState) {
+                FloodBannerState.DETOUR_ACTIVE -> " 🔀 우회 경로"
+                FloodBannerState.UNAVOIDABLE   -> " ⚠️ 위험구역 경유"
+                else -> ""
+            }
             onRouteReady("자동차 ${totalTime / 60}분 (%.1fkm)$suffix".format(totalDist / 1000.0))
         }
     }
@@ -370,7 +455,8 @@ class RouteManager(
     // ──────────────────────────────────────────
     private fun buildRouteBody(
         start: TMapPoint,
-        end: TMapPoint
+        end: TMapPoint,
+        passList: String? = null  // "lon1,lat1_lon2,lat2" 형식
     ): com.google.gson.JsonObject = com.google.gson.JsonObject().apply {
         addProperty("startX",       start.longitude.toString())
         addProperty("startY",       start.latitude.toString())
@@ -381,17 +467,18 @@ class RouteManager(
         addProperty("startName",    "출발지")
         addProperty("endName",      "목적지")
         addProperty("trafficInfo",  "Y")
+        if (passList != null) addProperty("passList", passList)
     }
 
     // ──────────────────────────────────────────
     // 폴리라인 그리기
     // ──────────────────────────────────────────
-    fun drawPolyline(floodWarning: Boolean = false) {
+    fun drawPolyline(isDetour: Boolean = false) {
         tMapView.removeTMapPolyLine("route")
         if (allRoutePoints.isEmpty()) return
 
-        val lineColor    = AndroidColor.parseColor("#215CF3")
-        val outLineColor = AndroidColor.parseColor("#1976D2")
+        val lineColor    = if (isDetour) AndroidColor.parseColor("#FF6600") else AndroidColor.parseColor("#215CF3")
+        val outLineColor = if (isDetour) AndroidColor.parseColor("#CC4400") else AndroidColor.parseColor("#1976D2")
 
         val poly = TMapPolyLine("route", ArrayList(allRoutePoints)).apply {
             setLineColor(lineColor)

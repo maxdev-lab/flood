@@ -47,10 +47,24 @@ class LocationSensorManager(
     private var lastMarkerAzimuth = 0f
 
     // ──────────────────────────────────────────
-    // 현재 위치
-    // ──────────────────────────────────────────
-    var currentLocation: TMapPoint? = null
+// 현재 위치 (에뮬레이터용 방어 코드 포함)
+// ──────────────────────────────────────────
+    private var _currentLocation: TMapPoint? = null
+    var currentLocation: TMapPoint?
+        get() {
+            val loc = _currentLocation ?: return null
 
+            // 위도 33~43, 경도 124~132 범위를 벗어나면 대한민국 지공간이 아님 (에뮬레이터 미국 좌표 등)
+            return if (loc.latitude < 33.0 || loc.latitude > 43.0 || loc.longitude < 124.0 || loc.longitude > 132.0) {
+                // 개발/테스트용 강남역 좌표로 대체 반환
+                TMapPoint(37.497952, 127.027619)
+            } else {
+                loc
+            }
+        }
+        set(value) {
+            _currentLocation = value
+        }
     // ──────────────────────────────────────────
     // LocationCallback
     // ──────────────────────────────────────────
@@ -90,8 +104,8 @@ class LocationSensorManager(
     }
 
     // ──────────────────────────────────────────
-    // 초기 위치 가져오기
-    // ──────────────────────────────────────────
+// 초기 위치 가져오기 (보완된 버전)
+// ──────────────────────────────────────────
     @SuppressLint("MissingPermission")
     fun fetchCurrentLocation() {
         if (ActivityCompat.checkSelfPermission(activity, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -102,21 +116,41 @@ class LocationSensorManager(
                 val pt = TMapPoint(loc.latitude, loc.longitude)
                 currentLocation = pt
                 updateMyLocationMarker()
-                // tMapView가 Window에 완전히 attach된 후 setCenterPoint가 동작함
-                // post()로 현재 메시지 큐 뒤에 실행 → layout 완료 보장
+
+                // 기존 방어 코드가 동작하여 대한민국 좌표(또는 강남역)로 중심점이 잡힙니다.
+                val finalLat = currentLocation?.latitude ?: loc.latitude
+                val finalLng = currentLocation?.longitude ?: loc.longitude
+
                 tMapView.post {
-                    tMapView.setCenterPoint(loc.latitude, loc.longitude)
+                    tMapView.setCenterPoint(finalLat, finalLng)
                     tMapView.zoomLevel = 15
                 }
             } else {
                 // lastLocation이 null이면 실시간으로 한 번 받아오기
                 val req = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000)
                     .setMaxUpdates(1).build()
-                fusedLocationClient.requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
+
+                // 콜백을 약간 수정하여 받아오는 즉시 맵 중심점도 이동되도록 보완할 수 있습니다.
+                fusedLocationClient.requestLocationUpdates(req, object : LocationCallback() {
+                    override fun onLocationResult(result: LocationResult) {
+                        result.lastLocation?.let { newLoc ->
+                            val pt = TMapPoint(newLoc.latitude, newLoc.longitude)
+                            currentLocation = pt
+                            updateMyLocationMarker()
+
+                            val finalLat = currentLocation?.latitude ?: newLoc.latitude
+                            val finalLng = currentLocation?.longitude ?: newLoc.longitude
+
+                            tMapView.post {
+                                tMapView.setCenterPoint(finalLat, finalLng)
+                                tMapView.zoomLevel = 15
+                            }
+                        }
+                    }
+                }, Looper.getMainLooper())
             }
         }
     }
-
     // ──────────────────────────────────────────
     // 실제 주행 위치 업데이트 시작/종료
     // ──────────────────────────────────────────

@@ -28,21 +28,24 @@ scheduler = AsyncIOScheduler()
 # ── MAPE-K 루프 ──────────────────────────────────────────────
 
 async def run_mape_loop() -> None:
-    """10초마다 실행되는 MAPE-K 루프"""
     print("\n" + "=" * 50)
     print("[MAPE-K] 루프 시작")
 
-    # 1. Monitor: 실시간 데이터 수집
-    realtime = await collect_realtime_data()
+    # Monitor: 시뮬레이션 모드면 가짜 데이터 사용
+    from app.mape.excute import get_simulate
+    sim_mode, sim_rain, sim_sewer = get_simulate()
 
-    # 2. Analyze: 위험 점수 산출
+    if sim_mode:
+        from app.mape.monitor import RealtimeData
+        realtime = RealtimeData(rainfall_mm=sim_rain, sewer_level=sim_sewer)
+        print(f"[SIMULATE] 강수량: {sim_rain}mm/hr, 수위: {sim_sewer}m")
+    else:
+        realtime = await collect_realtime_data()
+
     async with AsyncSessionLocal() as session:
         results = await analyze_all_grids(session, realtime=realtime)
 
-    # 3. Plan: (경로 계산은 사용자 요청 시 수행 → plan.py)
-    # 4. Execute: 캐시 저장 + 콘솔 출력
     execute(results)
-
     print("=" * 50)
 
 
@@ -85,5 +88,16 @@ def health_check():
 # 라우터 등록
 app.include_router(routes.router)
 
-# 실행: uvicorn app.main:app --reload
+# 실행: python -m uvicorn app.main:app --reload
 #docker-compose up -d db
+
+#신논현역
+#래미안서초스위트
+#원명초등학교
+#풍림지오빌아파트
+#demo_quick
+#gangnam_extreme
+#prolonged_rain
+#sudden_heavy_rain
+#티스테이션 서초점
+#브라운스톤 로얄스위트

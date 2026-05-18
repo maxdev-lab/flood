@@ -1,5 +1,7 @@
 ﻿import math
 import time as _time
+import psycopg2
+ 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,17 +16,40 @@ from app.mape.plan import find_safe_route
 
 router = APIRouter(prefix="/api/v1", tags=["Client API"])
 
+
+def _load_grid_coords():
+    global _GRID_COORDS
+    try:
+        conn = psycopg2.connect(
+            host='localhost', port=5432,
+            dbname='flood_db', user='postgres', password='1234'
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT grid_id, latitude, longitude FROM grid_coords;")
+        _GRID_COORDS = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+        cur.close()
+        conn.close()
+        print(f"[Routes] 격자 좌표 캐시 로드: {len(_GRID_COORDS)}개")
+    except Exception as e:
+        print(f"[Routes] 격자 좌표 로드 실패: {e} → 계산 방식 사용")
+
+_load_grid_coords()
+
 _COLS = 38
 _START_LAT = 37.4640
 _START_LON = 127.0030
 _LAT_STEP = 100 / 111000
 _LON_STEP = 100 / (111000 * math.cos(math.radians(37.5)))
 
-def gid_to_center(gid):
+def gid_to_center(gid: int):
+    if gid in _GRID_COORDS:
+        return _GRID_COORDS[gid]
+    # fallback: 기존 계산
     idx = gid - 1
     row = idx // _COLS
     col = idx % _COLS
-    return round(_START_LAT + (row + 0.5) * _LAT_STEP, 6), round(_START_LON + (col + 0.5) * _LON_STEP, 6)
+    return round(_START_LAT + (row + 0.5) * _LAT_STEP, 6), \
+           round(_START_LON + (col + 0.5) * _LON_STEP, 6)
 
 class FloodCellOut(BaseModel):
     centerLat: float
@@ -106,3 +131,90 @@ def update_user_location(user_id: str, location_data: schemas.LocationUpdateRequ
 @router.get("/risk/heatmap", response_model=schemas.HeatmapResponse)
 def get_risk_heatmap(lat: float = Query(...), lng: float = Query(...), radius: int = Query(1000), db: Session = Depends(get_db)):
     return schemas.HeatmapResponse(grids=crud.get_heatmap_data(db, lat=lat, lng=lng, radius_m=radius))
+
+# ── 시뮬레이션 ────────────────────────────────────────────────
+from app.mape.excute import set_simulate, clear_simulate, get_simulate
+
+class SimulateRequest(BaseModel):
+    rainfall_mm: float = 0.0
+    sewer_level: float = 0.0
+
+@router.post("/simulate/start")
+async def start_simulate(req: SimulateRequest):
+    set_simulate(req.rainfall_mm, req.sewer_level)
+    return {
+        "status": "simulation_started",
+        "rainfall_mm": req.rainfall_mm,
+        "sewer_level": req.sewer_level,
+        "message": f"강수량 {req.rainfall_mm}mm/hr, 수위 {req.sewer_level}m 시뮬레이션 시작"
+    }
+
+@router.post("/simulate/stop")
+async def stop_simulate():
+    clear_simulate()
+    return {"status": "simulation_stopped", "message": "실제 데이터로 복귀"}
+
+@router.get("/simulate/status")
+async def simulate_status():
+    mode, rain, sewer = get_simulate()
+    return {"simulate_mode": mode, "rainfall_mm": rain, "sewer_level": sewer}
+
+from app.mape.scenario_simulator import scenario_simulator, SCENARIOS
+ 
+# ── 시나리오 목록 조회 ────────────────────────────────────────
+@router.get("/scenario/list")
+async def list_scenarios():
+    """사용 가능한 시나리오 목록 반환."""
+    return {
+        "scenarios": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "total_steps": len(s.steps),
+                "total_duration_sec": sum(step.duration_sec for step in s.steps),
+                "steps": [
+                    {
+                        "step": i + 1,
+                        "description": step.description,
+                        "rainfall_mm": step.rainfall_mm,
+                        "sewer_level": step.sewer_level,
+                        "duration_sec": step.duration_sec,
+                    }
+                    for i, step in enumerate(s.steps)
+                ]
+            }
+            for s in SCENARIOS.values()
+        ]
+    }
+ 
+# ── 시나리오 시작 ────────────────────────────────────────────
+@router.post("/scenario/start/{scenario_id}")
+async def start_scenario(scenario_id: str):
+    """지정 시나리오 시작."""
+    if scenario_id not in SCENARIOS:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail=f"시나리오 '{scenario_id}'를 찾을 수 없습니다.")
+ 
+    await scenario_simulator.start(scenario_id)
+    s = SCENARIOS[scenario_id]
+    return {
+        "status": "scenario_started",
+        "scenario_id": scenario_id,
+        "scenario_name": s.name,
+        "total_steps": len(s.steps),
+        "total_duration_sec": sum(step.duration_sec for step in s.steps),
+    }
+ 
+# ── 시나리오 중단 ────────────────────────────────────────────
+@router.post("/scenario/stop")
+async def stop_scenario():
+    """실행 중인 시나리오 중단."""
+    await scenario_simulator.stop()
+    return {"status": "scenario_stopped", "message": "실제 데이터 수집으로 복귀"}
+ 
+# ── 시나리오 상태 조회 ───────────────────────────────────────
+@router.get("/scenario/status")
+async def scenario_status():
+    """현재 시나리오 실행 상태 조회."""
+    return scenario_simulator.status

@@ -503,22 +503,58 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private fun findRouteFromSearch() {
         if (uiOriginQuery.isBlank() || uiDestQuery.isBlank()) return
 
-        val startPoint = if (originPoi == null) {
-            locationManager.currentLocation
-        } else {
-            val lat = originPoi!!.noorLat.toDoubleOrNull()
-            val lon = originPoi!!.noorLon.toDoubleOrNull()
-            if (lat != null && lon != null) com.skt.tmap.TMapPoint(lat, lon)
-            else locationManager.currentLocation
-        }
-
-        if (startPoint == null) {
-            Toast.makeText(this, "현재 위치를 가져오는 중입니다. 잠시 후 다시 시도해주세요.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
         uiShowSearchScreen = false
-        routeManager.searchAndRoute(uiDestQuery, startPoint)
+
+        // 출발지 좌표 결정
+        val startPoint: com.skt.tmap.TMapPoint? = when {
+            // 1) 출발지 POI 명시적 선택
+            originPoi != null -> {
+                val lat = originPoi!!.noorLat.toDoubleOrNull()
+                val lon = originPoi!!.noorLon.toDoubleOrNull()
+                if (lat != null && lon != null) com.skt.tmap.TMapPoint(lat, lon)
+                else locationManager.currentLocation
+            }
+            // 2) "현재 위치" 텍스트 → GPS 사용
+            uiOriginQuery.contains("현재 위치") || uiOriginQuery.contains("내 위치") -> {
+                locationManager.currentLocation
+            }
+            // 3) 텍스트 입력 → POI 검색해서 좌표 가져오기
+            else -> null  // 아래에서 비동기 검색
+        }
+
+        if (startPoint != null) {
+            // 바로 경로 탐색
+            routeManager.searchAndRoute(uiDestQuery, startPoint)
+        } else {
+            // 출발지 텍스트로 POI 검색 후 경로 탐색
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val resp = RetrofitClient.tmapService.searchPOI(
+                        appKey  = BuildConfig.TMAP_APP_KEY,
+                        keyword = uiOriginQuery
+                    )
+                    val poi = resp.body()?.searchPoiInfo?.pois?.poiList?.firstOrNull()
+                    withContext(Dispatchers.Main) {
+                        if (poi != null) {
+                            val lat = poi.noorLat.toDoubleOrNull()
+                            val lon = poi.noorLon.toDoubleOrNull()
+                            if (lat != null && lon != null) {
+                                val start = com.skt.tmap.TMapPoint(lat, lon)
+                                routeManager.searchAndRoute(uiDestQuery, start)
+                            } else {
+                                Toast.makeText(this@MainActivity, "출발지 좌표를 찾을 수 없습니다.", Toast.LENGTH_SHORT).show()
+                            }
+                        } else {
+                            Toast.makeText(this@MainActivity, "출발지를 찾을 수 없습니다.", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "출발지 검색 중 오류가 발생했습니다.", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
     }
 
     // ──────────────────────────────────────────
